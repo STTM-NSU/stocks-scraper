@@ -5,6 +5,7 @@ RUN go env -w GOCACHE=/.cache
 
 COPY ./ ./
 
+RUN go install github.com/maoueh/zap-pretty/cmd/zap-pretty@latest
 RUN --mount=type=cache,target=/.cache go build -mod=vendor -v -o stocks-scraper ./cmd/stocks-scraper
 
-CMD ["./stocks-scraper"]
+ENTRYPOINT exec ./stocks-scraper | zap-pretty
