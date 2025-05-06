@@ -43,6 +43,7 @@ type DaemonScraper struct {
 
 func NewDaemonScraper(client *investgo.Client,
 	instrumentsService *instruments.InstrumentService,
+	from time.Time,
 	useMOEXInstruments bool,
 	stocksChanCap int,
 	logger logger.Logger,
@@ -54,6 +55,7 @@ func NewDaemonScraper(client *investgo.Client,
 	return &DaemonScraper{
 		client:             client,
 		instrumentsService: instrumentsService,
+		from:               from,
 		useMOEXInstruments: useMOEXInstruments,
 		stocksCh:           make(chan batch, stocksChanCap),
 		instrData:          make(map[string]*instrData),
@@ -95,25 +97,39 @@ func (s *DaemonScraper) Run(ctx context.Context, cmdCh <-chan model.UpdateMsg) {
 			}
 			switch cmd.Command {
 			case model.Add:
-				if cmd.InstrumentId != "" {
-					instr, err := s.instrumentsService.GetInstrumentById(cmd.InstrumentId)
-					if err != nil {
-						s.logger.Errorf("can't find instrument %s: %s", cmd.InstrumentId, err)
-					}
-					if instr != nil {
-						s.RunForSingleInstrument(ctx, *instr)
-					}
-				}
+				s.processAdd(ctx, cmd.InstrumentId)
 			case model.Delete:
-				s.mu.Lock()
-				if i, ok := s.instrData[cmd.InstrumentId]; ok && i != nil {
-					i.cancelFunc()
-					delete(s.instrData, cmd.InstrumentId)
-				}
-				s.mu.Unlock()
+				s.processDelete(cmd.InstrumentId)
 			}
 		}
 	}
+}
+
+func (s *DaemonScraper) processAdd(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+
+	if _, ok := s.instrData[id]; ok {
+		return
+	}
+
+	instr, err := s.instrumentsService.GetInstrumentById(id)
+	if err != nil {
+		s.logger.Errorf("can't find instrument %s: %s", id, err)
+	}
+	if instr != nil {
+		s.RunForSingleInstrument(ctx, *instr)
+	}
+}
+
+func (s *DaemonScraper) processDelete(id string) {
+	s.mu.Lock()
+	if i, ok := s.instrData[id]; ok && i != nil {
+		i.cancelFunc()
+		delete(s.instrData, id)
+	}
+	s.mu.Unlock()
 }
 
 func (s *DaemonScraper) RunForSingleInstrument(ctx context.Context, instr model.Instrument) {

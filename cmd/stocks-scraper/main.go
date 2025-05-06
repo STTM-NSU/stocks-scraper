@@ -79,6 +79,7 @@ func main() {
 	daemonScraper := scraper.NewDaemonScraper(
 		investClient,
 		instrumentsService,
+		scraperCfg.From,
 		scraperCfg.UseMOEXIndexInstruments,
 		_stocksChannelCap,
 		zapLogger,
