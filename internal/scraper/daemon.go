@@ -148,7 +148,8 @@ func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr mo
 			return fmt.Errorf("%w: context done for %s", ctx.Err(), instr.Id)
 		}
 
-		start, end := getIntervalFunc()
+		now := time.Now()
+		start, end := getIntervalFunc(now)
 
 		s.rateLimiter.Take()
 		resp, err := mdClient.GetCandles(instr.Id, investapi.CandleInterval_CANDLE_INTERVAL_HOUR, start, end, 0, 0)
@@ -158,12 +159,14 @@ func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr mo
 		}
 		s.logger.Debugf("got candles [%s, %s, %s]: %v", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), resp.GetCandles())
 
-		s.stocksCh <- batch{
-			instrumentId: instr.Id,
-			candles:      resp.GetCandles(),
+		if len(resp.GetCandles()) > 0 {
+			s.stocksCh <- batch{
+				instrumentId: instr.Id,
+				candles:      resp.GetCandles(),
+			}
 		}
 
-		if end.After(time.Now()) {
+		if end.Compare(now) >= 0 {
 			s.changeReady(instr.Id, true)
 			s.logger.Infof("end scraping %s stocks for interval = [%s, %s, %s]", instr.Id, s.from, start, end)
 			select {
@@ -196,14 +199,13 @@ func (s *DaemonScraper) IsInstrumentReady(instrumentId string) (ok, exist bool) 
 	return data.ready, true
 }
 
-func (s *DaemonScraper) getNextInterval(limit time.Duration, firstCandleDate time.Time) func() (time.Time, time.Time) {
+func (s *DaemonScraper) getNextInterval(limit time.Duration, firstCandleDate time.Time) func(now time.Time) (time.Time, time.Time) {
 	start := s.from
 	if start.Before(firstCandleDate) {
 		start = firstCandleDate
 	}
-	return func() (time.Time, time.Time) {
+	return func(now time.Time) (time.Time, time.Time) {
 		next := start.Add(limit)
-		now := time.Now()
 		if next.After(now) {
 			next = now
 		}
