@@ -38,6 +38,7 @@ func (c *Config) Setup() *Config {
 		defaultPort     = "5432"
 		defaultUsername = "postgres"
 		defaultPassword = "postgres"
+		defaultDBName   = "postgres"
 		defaultSSLMode  = "disable"
 	)
 
@@ -48,6 +49,7 @@ func (c *Config) Setup() *Config {
 	}
 	c.Username = cmp.Or(c.Username, defaultUsername)
 	c.Password = cmp.Or(c.Password, defaultPassword)
+	c.DBName = cmp.Or(c.DBName, defaultDBName)
 	c.SSLMode = cmp.Or(c.SSLMode, defaultSSLMode)
 
 	return c
@@ -64,6 +66,10 @@ func NewDB(cfg *Config) (*sqlx.DB, error) {
 	return sqlx.Connect("postgres", cfg.String())
 }
 
-func PrepareStmt(ctx context.Context, db *sqlx.DB) (*sql.Stmt, error) {
+func PrepareStocksStmt(ctx context.Context, db *sqlx.DB) (*sql.Stmt, error) {
 	return db.PrepareContext(ctx, "INSERT INTO stocks (instrument_id, ts, close_price) VALUES ($1, $2, $3)")
+}
+
+func PrepareInstrumentsStmt(ctx context.Context, db *sqlx.DB) (*sql.Stmt, error) {
+	return db.PrepareContext(ctx, "INSERT INTO instruments (id, first_candle_date) VALUES ($1, $2)")
 }

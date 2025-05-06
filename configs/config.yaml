@@ -1,5 +1,4 @@
 instruments_id:
 use_moex_index_instruments: true
-scrape_interval:
-  from: 2013-01-01T00:00:00Z
+from: 2013-01-01T00:00:00Z
 port: 8082

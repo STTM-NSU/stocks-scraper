@@ -50,5 +50,7 @@ func (s *singleBatchUpdater) saveStockDB(stock model.Stock) error {
 	if err != nil {
 		return fmt.Errorf("%w: can't exec stmt", err)
 	}
+	s.logger.Infof("save data to db: [%v]", stock)
+
 	return nil
 }

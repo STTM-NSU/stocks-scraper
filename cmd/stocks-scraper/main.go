@@ -16,6 +16,7 @@ import (
 	"github.com/STTM-NSU/stocks-scraper/internal/postgres"
 	"github.com/STTM-NSU/stocks-scraper/internal/scraper"
 	"github.com/STTM-NSU/stocks-scraper/internal/server"
+	"github.com/joho/godotenv"
 	"github.com/russianinvestments/invest-api-go-sdk/investgo"
 )
 
@@ -35,6 +36,10 @@ func main() {
 	}
 	defer loggerSync()
 
+	if err := godotenv.Load(); err != nil {
+		zapLogger.Warnf("can't detect .env file")
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -45,9 +50,14 @@ func main() {
 		zapLogger.Fatalf("%s: can't connect to db", err)
 	}
 
-	stmt, err := postgres.PrepareStmt(ctx, db)
+	stocksStmt, err := postgres.PrepareStocksStmt(ctx, db)
 	if err != nil {
-		zapLogger.Fatalf("%s: can' prepare stmt", err)
+		zapLogger.Fatalf("%s: can't prepare stmt", err)
+	}
+
+	instrStmt, err := postgres.PrepareInstrumentsStmt(ctx, db)
+	if err != nil {
+		zapLogger.Fatalf("%s: can't prepare stmt", err)
 	}
 
 	investCfg, err := config.LoadInvestConfig(_investCfgFilePath)
@@ -65,17 +75,16 @@ func main() {
 		zapLogger.Fatalf("%s", err)
 	}
 
-	if scraperCfg.UseMOEXIndexInstruments {
-		instrumentsId, err := instruments.GetMOEXIndexInstruments(investClient)
-		if err != nil {
-			zapLogger.Fatalf("%s: can't get moex index instruments", err)
-		}
-		scraperCfg.InstrumentsId = instrumentsId
-	}
-
-	daemonScraper := scraper.NewDaemonScraper(investClient, scraperCfg, _stocksChannelCap, zapLogger)
+	instrumentsService := instruments.NewInstrumentService(investClient, instrStmt, zapLogger)
+	daemonScraper := scraper.NewDaemonScraper(
+		investClient,
+		instrumentsService,
+		scraperCfg.UseMOEXIndexInstruments,
+		_stocksChannelCap,
+		zapLogger,
+	)
 	h := handler.NewHandler(daemonScraper, zapLogger)
-	batchUpdater := scraper.NewBatchUpdaterPool(stmt, _batchUpdaterPoolSize, _batchChannelCap, zapLogger)
+	batchUpdater := scraper.NewBatchUpdaterPool(stocksStmt, _batchUpdaterPoolSize, _batchChannelCap, zapLogger)
 
 	var wg sync.WaitGroup
 
@@ -83,38 +92,46 @@ func main() {
 	go func() {
 		defer wg.Done()
 		batchUpdater.Run(ctx, daemonScraper.GetStocksChan())
+		zapLogger.Infoln("shutdowned batch updater")
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		daemonScraper.Run(ctx, h.GetCmdCh())
+		zapLogger.Infoln("shutdowned daemon scraper")
 	}()
-
-	srv := server.NewHTTPServer(scraperCfg.Port, h.InitRoutes())
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := srv.Start(); !errors.Is(err, http.ErrServerClosed) {
+		srv := server.NewHTTPServer(ctx, scraperCfg.Port, h.InitRoutes())
+		if err := srv.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			zapLogger.Fatalf("can't start server: %s", err)
 		}
+		zapLogger.Infoln("server stopped")
 	}()
 	zapLogger.Infof("started server on port %s", scraperCfg.Port)
 
 	<-ctx.Done()
-	zapLogger.Infoln("shutdown server")
+	zapLogger.Infoln("start graceful shutdown")
 	wg.Wait()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		zapLogger.Errorf("can't shutdown server: %s", err)
+	if err := stocksStmt.Close(); err != nil {
+		zapLogger.Errorf("%s: can't close stmt", err)
+	} else {
+		zapLogger.Infoln("shutdowned stocks stmt")
 	}
 
-	if err := stmt.Close(); err != nil {
+	if err := instrStmt.Close(); err != nil {
 		zapLogger.Errorf("%s: can't close stmt", err)
+	} else {
+		zapLogger.Infoln("shutdowned instr stmt")
 	}
 
 	if err := db.Close(); err != nil {
 		zapLogger.Errorf("%s: can't close db", err)
+	} else {
+		zapLogger.Infoln("shutdowned db")
 	}
 }

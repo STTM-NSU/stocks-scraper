@@ -6,11 +6,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/STTM-NSU/stocks-scraper/internal/config"
+	"github.com/STTM-NSU/stocks-scraper/internal/instruments"
 	"github.com/STTM-NSU/stocks-scraper/internal/logger"
 	"github.com/STTM-NSU/stocks-scraper/internal/model"
 	"github.com/russianinvestments/invest-api-go-sdk/investgo"
 	investapi "github.com/russianinvestments/invest-api-go-sdk/proto"
+	"go.uber.org/ratelimit"
 )
 
 const (
@@ -24,19 +25,25 @@ type instrData struct {
 }
 
 type DaemonScraper struct {
-	client   *investgo.Client
-	cfg      config.ScraperConfig
+	client             *investgo.Client
+	from               time.Time
+	instrumentsService *instruments.InstrumentService
+	useMOEXInstruments bool
+
 	stocksCh chan batch
 	wg       sync.WaitGroup
 
 	instrData map[string]*instrData
 	mu        sync.RWMutex
 
+	rateLimiter ratelimit.Limiter
+
 	logger logger.Logger
 }
 
 func NewDaemonScraper(client *investgo.Client,
-	cfg config.ScraperConfig,
+	instrumentsService *instruments.InstrumentService,
+	useMOEXInstruments bool,
 	stocksChanCap int,
 	logger logger.Logger,
 ) *DaemonScraper {
@@ -45,11 +52,13 @@ func NewDaemonScraper(client *investgo.Client,
 	}
 
 	return &DaemonScraper{
-		client:    client,
-		cfg:       cfg,
-		stocksCh:  make(chan batch, stocksChanCap),
-		instrData: make(map[string]*instrData),
-		logger:    logger,
+		client:             client,
+		instrumentsService: instrumentsService,
+		useMOEXInstruments: useMOEXInstruments,
+		stocksCh:           make(chan batch, stocksChanCap),
+		instrData:          make(map[string]*instrData),
+		rateLimiter:        ratelimit.New(600, ratelimit.Per(1*time.Minute)),
+		logger:             logger,
 	}
 }
 
@@ -63,8 +72,17 @@ func (s *DaemonScraper) Run(ctx context.Context, cmdCh <-chan model.UpdateMsg) {
 		close(s.stocksCh)
 	}()
 
-	for _, instrId := range s.cfg.InstrumentsId {
-		s.RunForSingleInstrument(ctx, instrId)
+	var initInstruments []model.Instrument
+	if s.useMOEXInstruments {
+		if instrs, err := s.instrumentsService.GetMOEXIndexInstruments(); err != nil {
+			s.logger.Errorf("%s: can't get MOEX instruments", err)
+		} else {
+			initInstruments = instrs
+		}
+	}
+
+	for _, instr := range initInstruments {
+		s.RunForSingleInstrument(ctx, instr)
 	}
 
 	for {
@@ -78,7 +96,13 @@ func (s *DaemonScraper) Run(ctx context.Context, cmdCh <-chan model.UpdateMsg) {
 			switch cmd.Command {
 			case model.Add:
 				if cmd.InstrumentId != "" {
-					s.RunForSingleInstrument(ctx, cmd.InstrumentId)
+					instr, err := s.instrumentsService.GetInstrumentById(cmd.InstrumentId)
+					if err != nil {
+						s.logger.Errorf("can't find instrument %s: %s", cmd.InstrumentId, err)
+					}
+					if instr != nil {
+						s.RunForSingleInstrument(ctx, *instr)
+					}
 				}
 			case model.Delete:
 				s.mu.Lock()
@@ -92,7 +116,7 @@ func (s *DaemonScraper) Run(ctx context.Context, cmdCh <-chan model.UpdateMsg) {
 	}
 }
 
-func (s *DaemonScraper) RunForSingleInstrument(ctx context.Context, instrId string) {
+func (s *DaemonScraper) RunForSingleInstrument(ctx context.Context, instr model.Instrument) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -101,46 +125,52 @@ func (s *DaemonScraper) RunForSingleInstrument(ctx context.Context, instrId stri
 		defer cancel()
 
 		s.mu.Lock()
-		s.instrData[instrId] = &instrData{
+		s.instrData[instr.Id] = &instrData{
 			cancelFunc: cancel,
 			ready:      false,
 		}
 		s.mu.Unlock()
 
-		if err := s.consumeForSingleInstrument(ctx, instrId); err != nil {
-			s.logger.Errorf("%s: can't consume for %s instrument", err, instrId)
+		if err := s.consumeForSingleInstrument(ctx, instr); err != nil {
+			s.logger.Errorf("%s: can't consume for %s instrument", err, instr.Id)
 		}
 	}()
 }
 
-func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instrId string) error {
+func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr model.Instrument) error {
 	mdClient := s.client.NewMarketDataServiceClient()
-	getIntervalFunc := s.getNextInterval(_hourCandlesMaxDuration)
+	getIntervalFunc := s.getNextInterval(_hourCandlesMaxDuration, instr.FirstCandleDate)
+
+	s.logger.Infof("start consuming for %s [%s or %s]", instr.Id, s.from, instr.FirstCandleDate)
 
 	for {
 		if ctx.Err() != nil {
-			return fmt.Errorf("%w: context done for %s", ctx.Err(), instrId)
+			return fmt.Errorf("%w: context done for %s", ctx.Err(), instr.Id)
 		}
 
 		start, end := getIntervalFunc()
-		resp, err := mdClient.GetCandles(instrId, investapi.CandleInterval_CANDLE_INTERVAL_HOUR, start, end, 0, 0)
+
+		s.rateLimiter.Take()
+		resp, err := mdClient.GetCandles(instr.Id, investapi.CandleInterval_CANDLE_INTERVAL_HOUR, start, end, 0, 0)
 		if err != nil {
-			s.logger.Warnf("%s: can't get candlers for instrument %s and interval [%s, %s]", err, instrId, start, end)
+			s.logger.Warnf("%s: can't get candles for instrument %s and interval [%s, %s]", err, instr.Id, start, end)
 			continue
 		}
+		s.logger.Debugf("got candles [%s, %s, %s]: %v", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), resp.GetCandles())
+
 		s.stocksCh <- batch{
-			instrumentId: instrId,
+			instrumentId: instr.Id,
 			candles:      resp.GetCandles(),
 		}
 
 		if end.After(time.Now()) {
-			s.changeReady(instrId, true)
-			s.logger.Infof("end scraping %s stocks for interval = [%s, %s, %s]", instrId, s.cfg.From, start, end)
+			s.changeReady(instr.Id, true)
+			s.logger.Infof("end scraping %s stocks for interval = [%s, %s, %s]", instr.Id, s.from, start, end)
 			select {
 			case <-time.After(_waitInterval):
-				s.changeReady(instrId, false)
+				s.changeReady(instr.Id, false)
 			case <-ctx.Done():
-				return fmt.Errorf("%w: context done for %s", ctx.Err(), instrId)
+				return fmt.Errorf("%w: context done for %s", ctx.Err(), instr.Id)
 			}
 		}
 	}
@@ -157,7 +187,7 @@ func (s *DaemonScraper) changeReady(instrumentId string, ready bool) {
 
 func (s *DaemonScraper) IsInstrumentReady(instrumentId string) (ok, exist bool) {
 	s.mu.RLock()
-	defer s.mu.Unlock()
+	defer s.mu.RUnlock()
 	data, ok := s.instrData[instrumentId]
 	if !ok || data == nil {
 		return false, false
@@ -166,8 +196,11 @@ func (s *DaemonScraper) IsInstrumentReady(instrumentId string) (ok, exist bool) 
 	return data.ready, true
 }
 
-func (s *DaemonScraper) getNextInterval(limit time.Duration) func() (time.Time, time.Time) {
-	start := s.cfg.From
+func (s *DaemonScraper) getNextInterval(limit time.Duration, firstCandleDate time.Time) func() (time.Time, time.Time) {
+	start := s.from
+	if start.Before(firstCandleDate) {
+		start = firstCandleDate
+	}
 	return func() (time.Time, time.Time) {
 		next := start.Add(limit)
 		now := time.Now()
