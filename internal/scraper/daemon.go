@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	_hourCandlesMaxDuration = 7 * 24 * time.Hour
-	_waitInterval           = 4 * time.Hour
+	_hourCandlesMaxDuration = 2.5 * 31 * 24 * time.Hour
+	_waitInterval           = 1 * time.Hour
+	_retryForEmpties        = 3
+	_retryInterval          = 5 * time.Minute
 )
 
 type instrData struct {
@@ -153,11 +155,34 @@ func (s *DaemonScraper) RunForSingleInstrument(ctx context.Context, instr model.
 	}()
 }
 
+func retryForEmpty() func(empty bool) bool {
+	retries := _retryForEmpties
+	return func(empty bool) bool {
+		if !empty {
+			return false
+		}
+
+		retries--
+		if retries >= 0 {
+			return true
+		}
+
+		retries = _retryForEmpties
+		return false
+	}
+}
+
 func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr model.Instrument) error {
 	mdClient := s.client.NewMarketDataServiceClient()
 	getIntervalFunc := s.getNextInterval(_hourCandlesMaxDuration, instr.FirstCandleDate)
+	needRetryFunc := retryForEmpty()
 
 	s.logger.Infof("start consuming for %s [%s or %s]", instr.Id, s.from, instr.FirstCandleDate)
+
+	var (
+		start, end    time.Time
+		emptyResponse bool
+	)
 
 	for {
 		if ctx.Err() != nil {
@@ -165,7 +190,15 @@ func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr mo
 		}
 
 		now := time.Now()
-		start, end := getIntervalFunc(now)
+		if !needRetryFunc(emptyResponse) {
+			start, end = getIntervalFunc(now)
+		} else {
+			select {
+			case <-time.After(_retryInterval):
+			case <-ctx.Done():
+				return fmt.Errorf("%w: context done for %s", ctx.Err(), instr.Id)
+			}
+		}
 
 		s.rateLimiter.Take()
 		resp, err := mdClient.GetCandles(instr.Id, investapi.CandleInterval_CANDLE_INTERVAL_HOUR, start, end, 0, 0)
@@ -173,13 +206,19 @@ func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr mo
 			s.logger.Warnf("%s: can't get candles for instrument %s and interval [%s, %s]", err, instr.Id, start, end)
 			continue
 		}
-		s.logger.Debugf("got candles [%s, %s, %s]: %v", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), resp.GetCandles())
 
-		if len(resp.GetCandles()) > 0 {
-			s.stocksCh <- batch{
-				instrumentId: instr.Id,
-				candles:      resp.GetCandles(),
-			}
+		if len(resp.GetCandles()) == 0 {
+			s.logger.Warnf("got empty candles [%s, %s, %s]", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339))
+			emptyResponse = true
+			continue
+		}
+
+		s.logger.Infof("got candles [%s, %s, %s]: len=%d", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), len(resp.GetCandles()))
+
+		emptyResponse = false
+		s.stocksCh <- batch{
+			instrumentId: instr.Id,
+			candles:      resp.GetCandles(),
 		}
 
 		if end.Compare(now) >= 0 {

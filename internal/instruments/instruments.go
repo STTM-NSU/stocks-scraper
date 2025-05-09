@@ -85,7 +85,7 @@ func (s *InstrumentService) saveInstrumentToDB(i *model.Instrument) error {
 	if err != nil {
 		return fmt.Errorf("%w: can't exec stmt", err)
 	}
-	s.logger.Infof("save data to db: [%v]", i)
+	s.logger.Debugf("save instrument to db: [%v]", i)
 
 	return nil
 }
