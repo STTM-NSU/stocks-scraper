@@ -18,7 +18,7 @@ const (
 	_hourCandlesMaxDuration = 2.5 * 31 * 24 * time.Hour
 	_waitInterval           = 1 * time.Hour
 	_retryForEmpties        = 3
-	_retryInterval          = 5 * time.Minute
+	_retryInterval          = 20 * time.Minute
 )
 
 type instrData struct {
@@ -207,18 +207,16 @@ func (s *DaemonScraper) consumeForSingleInstrument(ctx context.Context, instr mo
 			continue
 		}
 
-		if len(resp.GetCandles()) == 0 {
+		if len(resp.GetCandles()) > 0 {
+			s.logger.Infof("got candles [%s, %s, %s]: len=%d", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), len(resp.GetCandles()))
+			emptyResponse = false
+			s.stocksCh <- batch{
+				instrumentId: instr.Id,
+				candles:      resp.GetCandles(),
+			}
+		} else {
 			s.logger.Warnf("got empty candles [%s, %s, %s]", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339))
 			emptyResponse = true
-			continue
-		}
-
-		s.logger.Infof("got candles [%s, %s, %s]: len=%d", instr.Id, start.Format(time.RFC3339), end.Format(time.RFC3339), len(resp.GetCandles()))
-
-		emptyResponse = false
-		s.stocksCh <- batch{
-			instrumentId: instr.Id,
-			candles:      resp.GetCandles(),
 		}
 
 		if end.Compare(now) >= 0 {

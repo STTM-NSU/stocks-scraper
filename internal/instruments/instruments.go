@@ -46,6 +46,11 @@ func (s *InstrumentService) GetInstrumentByTickerClassCode(ticker, classCode str
 		return nil, fmt.Errorf("%w: can't get isntrument", err)
 	}
 
+	if !resp.GetInstrument().GetBuyAvailableFlag() || !resp.GetInstrument().GetSellAvailableFlag() {
+		s.logger.Warnf("%s: can't operate with such instrument", resp.GetInstrument().GetFigi())
+		return nil, nil
+	}
+
 	instr := &model.Instrument{
 		Id:              resp.GetInstrument().GetFigi(),
 		FirstCandleDate: resp.GetInstrument().GetFirst_1MinCandleDate().AsTime(),
@@ -62,6 +67,11 @@ func (s *InstrumentService) GetInstrumentById(id string) (*model.Instrument, err
 	resp, err := s.client.InstrumentByFigi(id)
 	if err != nil {
 		return nil, fmt.Errorf("%w: can't get isntrument", err)
+	}
+
+	if !resp.GetInstrument().GetBuyAvailableFlag() || !resp.GetInstrument().GetSellAvailableFlag() {
+		s.logger.Warnf("%s: can't operate with such instrument", resp.GetInstrument().GetFigi())
+		return nil, nil
 	}
 
 	instr := &model.Instrument{
